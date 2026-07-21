@@ -47,22 +47,26 @@ that both subagents call into.
 
 ```
 /apps
-  /coordinator      Main service: webhook handler, orchestration, JIRA write-back
-  /classifier        Subagent module (called by Coordinator, in-process or via Agent SDK Task)
+  /coordinator      Main service: webhook handler (index.ts), orchestration +
+                    business rules (triage.ts), JIRA write-back (jira.ts,
+                    stubbed until Phase 4 — see "Decisions made in Phase 3")
+  /classifier        Subagent module (called by Coordinator, in-process — not
+                      an Agent SDK Task; see "Decisions made in Phase 2")
   /research           Subagent module (same)
   /dashboard          OPTIONAL React + Vite app, read-only view over the audit log
 /packages
-  /shared-types       Zod schemas for Ticket, ClassificationResult, ResearchResult
+  /shared-types       Zod schemas for Ticket, ClassificationResult,
+                      ResearchResult, TriageDecision
   /anthropic-client   Generic Anthropic Messages API wrapper (system+prompt in,
                       raw text out) with retry/backoff. No Classifier/Research-
                       specific logic lives here.
 /.github/workflows
   ci.yml              Runs on every PR: install, lint, typecheck, unit test, build
+  deploy.yml          Runs on merge to main: build/push images, deploy to Azure
 tsconfig.base.json    Shared compilerOptions, extended by every package/app
 tsconfig.json         Root TS project-references "solution" file (files: [],
                       references: [...]) — lets `tsc -b` build/typecheck the
                       whole graph in one command, in dependency order
-  deploy.yml          Runs on merge to main: build/push images, deploy to Azure
 ```
 
 ## Data contracts (do not change shapes without updating shared-types first)
@@ -93,6 +97,19 @@ tsconfig.json         Root TS project-references "solution" file (files: [],
 Both are validated with Zod at the boundary where the Coordinator receives
 them. Malformed subagent output should fail loudly (throw / log / route to
 human review), never silently pass through.
+
+**TriageDecision** (Coordinator's final output, added in Phase 3 — lives in
+`shared-types` alongside the other two since Phase 4's Cosmos DB audit log
+and the optional Phase 7 dashboard both need this same shape):
+```ts
+{
+  ticketKey: string,
+  outcome: "auto-routed" | "needs-human-triage" | "duplicate-short-circuit" | "security-escalation",
+  classification: ClassificationResult | null,  // null only if Classifier validation failed
+  research: ResearchResult | null,              // null if short-circuited, or if Research validation failed
+  reasoning: string
+}
+```
 
 ## Business rules the Coordinator enforces (on top of subagent output)
 
@@ -236,3 +253,69 @@ plus implementation notes worth knowing before Phase 3 builds on top.
   gitignored) were never committed, but "typecheck" and "build" are
   mechanically the same command now; the second one is just a fast
   incremental no-op.
+
+## Decisions made in Phase 3
+
+Phase 3 implemented Coordinator orchestration: a webhook route, sequential
+Classifier→Research calling with the business rules from CLAUDE.md applied,
+a stubbed ticket fetch, and a stubbed JIRA write-back. Real `mcp-atlassian`
+access, Docker, and CI are still untouched (Phase 4+).
+
+- **Project-references gap closed before writing orchestration code**, per
+  the Phase 2 flag. `apps/coordinator/tsconfig.json` now references
+  `packages/shared-types`, `apps/classifier`, and `apps/research` (not
+  `packages/anthropic-client` directly — it's transitively built as a
+  dependency of `classifier`/`research`'s own graphs). Verified with the
+  same clean-tree repro as Phase 2:
+  `npm run typecheck -w apps/coordinator` alone, on a tree with every
+  `dist/` and `*.tsbuildinfo` deleted, transitively builds all four
+  dependencies and passes with no manual pre-build step.
+- **`triageTicket(ticket, deps?)` in `apps/coordinator/src/triage.ts`** is
+  the pure orchestration function — HTTP-agnostic, takes an optional
+  `{ classify?, research? }` dependency-injection object defaulting to the
+  real `classifyTicket`/`researchTicket`, mirroring the DI pattern already
+  used for `AnthropicCompletionClient` in Phase 2. This is what's unit
+  tested (`apps/coordinator/src/triage.test.ts`, 8 cases); the Express
+  route in `index.ts` is a thin wrapper with no business logic of its own,
+  so no HTTP-level test tooling (e.g. `supertest`) was added — call this
+  out if a future phase wants route-level tests, since it'd be a new
+  dependency decision.
+- **Rule precedence, resolved exactly as flagged in `PHASE_3_PROMPT.md`:**
+  classify → if `duplicate_of` set AND confidence >= 0.8, short-circuit
+  immediately (`"duplicate-short-circuit"`, Research never called) — this
+  takes priority over everything else, including a `security` category,
+  because CLAUDE.md's rule for it has no category exception and explicitly
+  requires it ahead of the Research call. Otherwise, Research always runs
+  (even for `security` or low-confidence tickets, since CLAUDE.md doesn't
+  say to skip Research for those — a human reviewer still benefits from
+  Research's context), and only then do `category === "security"` (→
+  `"security-escalation"`) and `confidence < 0.6` (→ `"needs-human-triage"`)
+  decide final routing, else `"auto-routed"`.
+- **Low-confidence duplicate signal is preserved, not dropped.** If
+  `duplicate_of` is set but confidence is below 0.8, the short-circuit
+  doesn't fire — full triage proceeds — but the duplicate hint is appended
+  to the decision's `reasoning` string so it isn't silently lost.
+- **`TriageDecision` lives in `packages/shared-types`** (new
+  `decision.ts`), not in `apps/coordinator`, following the existing
+  `ClassificationResult`/`ResearchResult` pattern — see Data contracts
+  above for the shape and the exact 4-value `outcome` enum.
+- **Only `ClassificationValidationError`/`ResearchValidationError` are
+  caught inside `triageTicket`**; any other error (e.g. a network failure
+  from either subagent) is deliberately rethrown rather than reframed as
+  `"needs-human-triage"` — a transient system failure is not the same kind
+  of problem as bad model output, and collapsing them would hide real
+  outages behind a routing label. The Express route's try/catch is the
+  backstop for that case (logs and returns HTTP 500).
+- **Webhook payload is intentionally minimal**: `{ ticketKey: string }`,
+  validated with a local Zod schema in `index.ts` — not an attempt to
+  replicate JIRA's real webhook envelope, per the Phase 3 prompt's
+  guidance that real payload mapping is Phase 4's concern once
+  `mcp-atlassian` exists. `fetchTicket(ticketKey)` in `jira.ts` is the
+  stub that turns a key into a full (mocked) `Ticket`; `writeBackToJira`
+  is the stub for the write side. Both carry `// TODO(Phase 4):` markers
+  at the exact call site the real `mcp-atlassian` integration replaces.
+- **`vitest.config.ts` aliases extended** to `@jira-triage/classifier` and
+  `@jira-triage/research` (alongside the existing `shared-types`/
+  `anthropic-client` aliases), so Coordinator's tests also run against
+  current source rather than requiring a prebuilt `dist/` — consistent
+  with the reasoning behind the original two aliases in Phase 2.

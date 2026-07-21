@@ -16,6 +16,8 @@ export default defineConfig({
         __dirname,
         "packages/anthropic-client/src/index.ts",
       ),
+      "@jira-triage/classifier": path.resolve(__dirname, "apps/classifier/src/index.ts"),
+      "@jira-triage/research": path.resolve(__dirname, "apps/research/src/index.ts"),
     },
   },
 });
