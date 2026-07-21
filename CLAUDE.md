@@ -47,9 +47,11 @@ that both subagents call into.
 
 ```
 /apps
-  /coordinator      Main service: webhook handler (index.ts), orchestration +
-                    business rules (triage.ts), JIRA write-back (jira.ts,
-                    stubbed until Phase 4 — see "Decisions made in Phase 3")
+  /coordinator      Main service: webhook handler + idempotency guard
+                    (index.ts, idempotency.ts), orchestration + business
+                    rules (triage.ts), real JIRA access via mcp-atlassian
+                    (jira.ts, jiraMcpClient.ts — see "Decisions made in
+                    Phase 4"). Dockerfile builds this from the repo root.
   /classifier        Subagent module (called by Coordinator, in-process — not
                       an Agent SDK Task; see "Decisions made in Phase 2")
   /research           Subagent module (same)
@@ -63,6 +65,12 @@ that both subagents call into.
 /.github/workflows
   ci.yml              Runs on every PR: install, lint, typecheck, unit test, build
   deploy.yml          Runs on merge to main: build/push images, deploy to Azure
+docker-compose.yml    Coordinator + mcp-atlassian sidecar, local dev only —
+                      see "Decisions made in Phase 4"; NOT smoke-tested with
+                      real Docker in the session that wrote it
+.dockerignore         Keeps node_modules/dist/.git out of the build context
+.env.local.example    Template for `.env.local` (gitignored) — copy, fill in
+                      sandbox JIRA + Anthropic credentials
 tsconfig.base.json    Shared compilerOptions, extended by every package/app
 tsconfig.json         Root TS project-references "solution" file (files: [],
                       references: [...]) — lets `tsc -b` build/typecheck the
@@ -70,6 +78,23 @@ tsconfig.json         Root TS project-references "solution" file (files: [],
 ```
 
 ## Data contracts (do not change shapes without updating shared-types first)
+
+**Ticket** (Coordinator's internal domain shape, fed to both subagents —
+evaluated against real mcp-atlassian output in Phase 4 and kept unchanged;
+see "Decisions made in Phase 4" for why):
+```ts
+{
+  key: string,
+  projectKey: string,
+  summary: string,
+  description: string,        // markdown/plain text — mcp-atlassian converts
+                               // JIRA's Atlassian Document Format for you
+  reporter: string,            // flattened display name, resolved in
+                                // apps/coordinator/src/jira.ts's mapping layer
+  createdAt: string            // ISO-8601 UTC ("Z"), normalized in that same
+                                // mapping layer from JIRA's raw timestamp
+}
+```
 
 **ClassificationResult** (Classifier subagent output):
 ```ts
@@ -145,8 +170,11 @@ and the optional Phase 7 dashboard both need this same shape):
 
 ## Environments and secrets
 
-- **Local dev:** `.env.local` (gitignored) with dev-only keys, `docker-compose.yml`
-  runs Coordinator + mcp-atlassian sidecar together for local testing.
+- **Local dev:** `.env.local` (gitignored) with dev-only keys — copy
+  `.env.local.example` (committed template) and fill in real sandbox
+  values. `docker-compose.yml` runs Coordinator + mcp-atlassian sidecar
+  together for local testing (unverified — see "Decisions made in
+  Phase 4").
 - **CI:** no real secrets — unit/integration tests run against mocked
   Anthropic responses and a local mcp-atlassian instance pointed at a
   JIRA sandbox/test project, not production JIRA.
@@ -319,3 +347,141 @@ access, Docker, and CI are still untouched (Phase 4+).
   `anthropic-client` aliases), so Coordinator's tests also run against
   current source rather than requiring a prebuilt `dist/` — consistent
   with the reasoning behind the original two aliases in Phase 2.
+
+## Decisions made in Phase 4
+
+Phase 4 replaced the `fetchTicket`/`writeBackToJira` stubs with real
+mcp-atlassian calls, added local containerization, and resolved the
+`Ticket`-shape and webhook-idempotency questions flagged for this phase.
+**Important caveat up front: no JIRA sandbox project or credentials were
+available in this session** (CLAUDE.md's "Open items" checklist still has
+this unchecked below), and **Docker itself was not installed in this
+session's environment** — so nothing here has been verified end-to-end
+against a real sandbox ticket or a real `docker compose up`. Both gaps are
+called out explicitly at each relevant point below rather than glossed
+over; treat anything marked unverified as the first thing to smoke-test
+once a sandbox + Docker are both available.
+
+- **`Ticket`'s shape is unchanged.** Concluded it's fine as-is (see Data
+  contracts above) — the adaptation between JIRA's real representation and
+  this internal domain type happens entirely in
+  `apps/coordinator/src/jira.ts`'s mapping layer, not in the type itself:
+  - `description`: mcp-atlassian converts JIRA's Atlassian Document Format
+    to markdown/plain text at the tool boundary (confirmed via that
+    project's own markdown↔Jira-format conversion fix history, not by a
+    live response) — no ADF handling needed on our side.
+  - `reporter`: JIRA's real reporter is an object (`displayName`,
+    `emailAddress`, `accountId`), not a bare string. Rather than change
+    `Ticket.reporter`'s type (which would force an update to
+    `apps/classifier`'s `buildUserPrompt`, currently
+    `` `Reporter: ${ticket.reporter}` ``), the mapping layer flattens it to
+    the first available of `displayName` → `emailAddress` → `accountId` →
+    `"unknown-reporter"`. Classifier/Research are untouched.
+  - `createdAt`: JIRA's timestamp format doesn't reliably match strict
+    ISO-8601 (commonly a non-colon UTC offset like `+0000`). Normalized via
+    `new Date(fields.created).toISOString()` in the mapping layer, so
+    `TicketSchema`'s plain `.datetime()` validator (no `{ offset: true }`)
+    didn't need to change either.
+  - The stale "revisit in Phase 3" comment on `ticket.ts` is fixed to
+    reflect this Phase 4 resolution.
+- **mcp-atlassian facts confirmed by web research this session** (cited in
+  `PHASE_4_PROMPT.md`), **none verified against a live instance**:
+  Docker image `ghcr.io/sooperset/mcp-atlassian`; `jira_get_issue`,
+  `jira_add_comment` (takes a `body` param, accepts Markdown),
+  `jira_update_issue`, `jira_transition_issue`, `jira_search`,
+  `jira_create_issue` as real tool names; `TRANSPORT`/`PORT`/`HOST`/
+  `ENABLED_TOOLS`/`READ_ONLY_MODE` env vars. **Still not confirmed:** the
+  exact JSON shape `jira_get_issue` actually returns (the
+  `JiraIssueResponseSchema` in `jira.ts` is a best-effort guess based on
+  JIRA's own REST API conventions, explicitly commented as such — smoke
+  test against a real sandbox response before trusting it), and whether
+  there's a dedicated label-only tool (none was found; `writeBackToJira`
+  uses `jira_update_issue`'s `fields.labels` for this, see below).
+- **Chose `StreamableHTTPClientTransport` over `SSEClientTransport`** from
+  `@modelcontextprotocol/sdk` (v1.29.0) — the SDK's own docs mark
+  `SSEClientTransport` deprecated in favor of it, and it has built-in
+  `reconnectionOptions` (max delay, initial delay, backoff factor, max
+  retries), which directly satisfies the runtime-reconnect requirement
+  without hand-rolling stream-level reconnect logic.
+- **`apps/coordinator/src/jiraMcpClient.ts`** is the thin MCP-connection
+  wrapper (mirrors `packages/anthropic-client`'s role, but stays inside
+  `apps/coordinator` rather than becoming its own workspace package — it
+  has no reuse case outside the Coordinator, unlike the Anthropic client
+  which both subagents share). Two resilience layers, deliberately not
+  one: the transport's own `reconnectionOptions` handle the underlying
+  stream dropping; `callTool()` additionally retries explicitly on top
+  (discarding and re-establishing the cached connection on failure),
+  since a single failed request isn't the same problem as a dropped
+  stream. `JiraMcpClientLike` is the DI seam `jira.ts` depends on, mirror
+  of `AnthropicCompletionClient`. Known limitation, documented in code:
+  not concurrency-hardened for two simultaneous first connections.
+- **`ENABLED_TOOLS` scoped down on the sidecar** to exactly
+  `jira_get_issue,jira_add_comment,jira_update_issue` — the three tools
+  Coordinator actually calls — rather than the server's full ~98-tool
+  default, per the approved prompt's requirement (this same sidecar
+  config pattern will eventually point at production JIRA credentials, so
+  the minimal-scope habit starts now).
+- **Label updates re-fetch current labels and merge, rather than trusting
+  `jira_update_issue`'s `fields.labels` to be additive.** Real risk found
+  while writing this, not in the original prompt: JIRA's REST API
+  normally *replaces* the whole labels array on a plain `fields` update
+  (the additive form is a separate `update: { labels: [{ add: ... }] }`
+  operations shape) — sending just the triage label without checking
+  first could have silently wiped out a real ticket's existing labels.
+  `writeBackToJira` re-fetches labels immediately before updating and
+  sends the deduped union, which is correct regardless of which behavior
+  `jira_update_issue` actually has.
+- **No status transition is attempted.** `jira_transition_issue` needs a
+  transition id/name specific to each JIRA project's configured workflow,
+  which isn't knowable without inspecting a live project — hardcoding one
+  would likely fail, or worse, fire the wrong transition. Comment + a
+  `triage:<outcome>` label (e.g. `triage:security-escalation`) is the
+  outcome signal for this phase; transitions are left for whenever a real
+  target project's workflow can actually be inspected.
+- **Webhook-delivery idempotency**: added `apps/coordinator/src/idempotency.ts`,
+  an in-memory `Map`-based dedup guard keyed on the webhook payload's
+  optional `eventId` (new, optional field on the webhook schema), falling
+  back to `ticketKey` alone within a 2-minute TTL window when absent.
+  Explicitly non-durable — does not survive a restart, does not work
+  across replicas — and durable cross-restart dedup needs a real store
+  (Cosmos DB, per the audit-log architecture decision) which is
+  deliberately out of scope here (standing up real Cosmos DB is an Azure
+  resource, excluded from this local-containerization phase). **Separately
+  worth flagging: CLAUDE.md's "Build phases" list has no phase that
+  explicitly says "wire up Cosmos DB"** — it's only mentioned as an
+  architecture decision and as what the optional Phase 7 dashboard reads
+  from. This gap still exists; whoever picks up durable audit-logging/
+  idempotency should either fold it into an existing phase or add a new
+  one, rather than assume it's covered.
+- **Duplicate-detection scope: deferred, not done.** CLAUDE.md's system
+  description frames Tier 3 (JIRA-via-MCP) as something "both subagents
+  call into," which would mean giving Classifier (and maybe Research)
+  their own read-only mcp-atlassian access for real similar-ticket search
+  instead of today's model-reasoning-only `duplicate_of`. Judged this as
+  a second MCP consumer with its own auth/network-access questions, on
+  top of everything else in this phase, and out of scope for now.
+  Classifier/Research prompts are unchanged from Phase 2.
+- **Docker/docker-compose could not be verified in this session** — no
+  Docker installed in the environment that wrote them. `apps/coordinator/Dockerfile`
+  and `docker-compose.yml` are written carefully (multi-stage build, full
+  monorepo copy in the build stage to avoid partial-workspace
+  `npm ci`/lockfile-consistency issues, pruned `node_modules` copied into
+  a clean runtime stage) but are unverified — both files say so in their
+  own header comments. `docker-compose.yml`'s YAML syntax was validated
+  with `js-yaml` (structurally parses as intended); nothing beyond that.
+  Known accepted inefficiency: `npm prune --omit=dev` runs at the
+  workspace root, so it prunes relative to *all* workspaces including
+  `apps/dashboard` (react/vite deps) — the runtime image ships those
+  unused prod deps too, since filtering `npm ci`/`prune` to a subset of
+  workspaces risks the same lockfile-consistency problem a partial
+  monorepo copy would.
+- **Integration tests: unit-level only, by design, given the sandbox
+  gap.** `apps/coordinator/src/jira.test.ts` and `jiraMcpClient.test.ts`
+  mock the MCP client/SDK entirely — no real network calls, matching the
+  existing Classifier/Research testing pattern. No live-sandbox
+  integration tests were written, since there's no sandbox to run them
+  against; CLAUDE.md's "JIRA sandbox project key" open item is still
+  unchecked (unchanged from Phase 3). Don't treat `npm run test` passing
+  as evidence the real mcp-atlassian integration works — it only proves
+  the code behaves correctly against the assumed (unverified)
+  response shapes.

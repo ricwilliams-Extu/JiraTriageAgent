@@ -1,6 +1,7 @@
 import express from "express";
 import pino from "pino";
 import { z } from "zod";
+import { buildDedupeKey, isDuplicateDelivery } from "./idempotency.js";
 import { fetchTicket, writeBackToJira } from "./jira.js";
 import { triageTicket } from "./triage.js";
 
@@ -15,11 +16,12 @@ app.get("/health", (_req, res) => {
 });
 
 // Deliberately minimal — not a replica of JIRA's real webhook JSON envelope.
-// Phase 4 maps the real mcp-atlassian-sourced event onto this once JIRA
-// access exists; for now the payload only needs to identify which ticket to
-// triage.
+// `eventId` is optional since real JIRA webhook envelopes aren't modeled yet
+// either; when present it drives exact dedup, otherwise idempotency.ts falls
+// back to a ticketKey + TTL window (see its own doc comment for the tradeoff).
 const TicketEventSchema = z.object({
   ticketKey: z.string(),
+  eventId: z.string().optional(),
 });
 
 app.post("/webhooks/jira-ticket", async (req, res) => {
@@ -30,8 +32,15 @@ app.post("/webhooks/jira-ticket", async (req, res) => {
     return;
   }
 
-  const { ticketKey } = parsed.data;
-  logger.info({ ticketKey }, "received ticket event");
+  const { ticketKey, eventId } = parsed.data;
+  logger.info({ ticketKey, eventId }, "received ticket event");
+
+  const dedupeKey = buildDedupeKey(ticketKey, eventId);
+  if (isDuplicateDelivery(dedupeKey)) {
+    logger.warn({ ticketKey, eventId }, "duplicate webhook delivery, skipping");
+    res.status(200).json({ ticketKey, skipped: true, reason: "duplicate delivery" });
+    return;
+  }
 
   try {
     const ticket = await fetchTicket(ticketKey);
