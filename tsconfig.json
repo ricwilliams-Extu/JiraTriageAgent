@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared-types" },
+    { "path": "packages/anthropic-client" },
+    { "path": "apps/coordinator" },
+    { "path": "apps/classifier" },
+    { "path": "apps/research" }
+  ]
+}

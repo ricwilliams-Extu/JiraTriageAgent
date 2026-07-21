@@ -53,8 +53,15 @@ that both subagents call into.
   /dashboard          OPTIONAL React + Vite app, read-only view over the audit log
 /packages
   /shared-types       Zod schemas for Ticket, ClassificationResult, ResearchResult
+  /anthropic-client   Generic Anthropic Messages API wrapper (system+prompt in,
+                      raw text out) with retry/backoff. No Classifier/Research-
+                      specific logic lives here.
 /.github/workflows
   ci.yml              Runs on every PR: install, lint, typecheck, unit test, build
+tsconfig.base.json    Shared compilerOptions, extended by every package/app
+tsconfig.json         Root TS project-references "solution" file (files: [],
+                      references: [...]) — lets `tsc -b` build/typecheck the
+                      whole graph in one command, in dependency order
   deploy.yml          Runs on merge to main: build/push images, deploy to Azure
 ```
 
@@ -100,16 +107,24 @@ human review), never silently pass through.
 
 ## Coding conventions
 
-- Node LTS version: [fill in — e.g. 20.x]
+- Node LTS version: **20.x** (already reflected in root `package.json`
+  `engines.node: ">=20.0.0"`)
 - Package manager: npm (workspaces), not yarn/pnpm
 - Linting: ESLint + Prettier, config at repo root, shared across all apps
-- Testing: [fill in — e.g. Vitest], unit tests colocated with source
-  (`*.test.ts`), integration tests in a top-level `/tests` dir
-- All Anthropic API / Agent SDK calls should be wrapped in a thin client
-  module (not scattered `fetch` calls) so retry/error handling lives in
-  one place
-- Structured logging (not `console.log`) — [fill in tool, e.g. pino] —
-  every log line for a ticket should include the ticket key for traceability
+- Testing: **Vitest**, unit tests colocated with source (`*.test.ts`),
+  integration tests in a top-level `/tests` dir (not created yet — Phase
+  2 only needed subagent unit tests). Root `npm run test` runs `vitest run`
+  once across the whole repo (a root `vitest.config.ts` globs
+  `apps/*/src/**/*.test.ts` and `packages/*/src/**/*.test.ts`, so there's no
+  per-workspace test script to maintain).
+- All Anthropic API calls are wrapped in `packages/anthropic-client`
+  (not scattered `fetch` calls) so retry/error handling lives in one place.
+  See "Decisions made in Phase 2" below for why this is a raw
+  `@anthropic-ai/sdk` wrapper rather than the Agent SDK.
+- Structured logging (not `console.log`) — **pino** — every log line for a
+  ticket should include the ticket key for traceability. Currently used in
+  `apps/classifier` and `apps/research`; `packages/anthropic-client` stays
+  generic and does not log ticket context.
 
 ## Environments and secrets
 
@@ -139,8 +154,85 @@ quietly expanding scope.
 
 ## Open items to fill in before Phase 1 starts
 
-- [ ] Node LTS version to pin
-- [ ] Test framework choice (Vitest recommended, not required)
-- [ ] Logging library choice
+- [x] Node LTS version to pin — 20.x
+- [x] Test framework choice — Vitest
+- [x] Logging library choice — pino
 - [ ] Azure subscription / resource group names for the target environment
 - [ ] JIRA sandbox project key to use in CI integration tests
+
+## Decisions made in Phase 2
+
+Phase 2 implemented real Classifier/Research subagent logic on top of the
+Phase 1 scaffolding. Nothing in "Non-negotiable architecture decisions"
+changed; these are the choices made to fill in that phase's open items,
+plus implementation notes worth knowing before Phase 3 builds on top.
+
+- **Anthropic client lives in `packages/anthropic-client`**, not inside
+  `shared-types`. It has no dependency on Zod/Ticket/ClassificationResult —
+  it only knows `{ system, prompt, model?, maxTokens? } → string` — so it
+  can be a dependency of `shared-types`-consuming apps without a circular
+  or backwards dependency.
+- **Raw `@anthropic-ai/sdk` (Messages API), not the Agent SDK.** The
+  Classifier and Research subagents are single-turn "system prompt in,
+  JSON out" calls with no tool use, no multi-turn loop, and no need for
+  the Agent SDK's subprocess/session model. The Agent SDK is the right
+  fit for the Coordinator's orchestration loop (Phase 3) if it ends up
+  spawning subagents as actual Agent SDK tasks — that's a Phase 3 decision,
+  not foreclosed by this one.
+- **Retry strategy:** the client disables the SDK's own built-in retry
+  (`maxRetries: 0` on the `Anthropic` client) and instead retries itself,
+  explicitly, so behavior is observable/testable rather than hidden inside
+  the SDK. Retries on `RateLimitError`/`5xx` (via `APIError.status`) and
+  `APIConnectionError`, up to 3 attempts, exponential backoff starting at
+  500ms (500ms, 1000ms, 2000ms). Non-retryable errors (4xx other than 429,
+  malformed-response errors) throw immediately.
+- **Fail-loud validation errors:** `ClassificationValidationError` and
+  `ResearchValidationError` (one per subagent, defined alongside each
+  subagent's code, not in shared-types) are thrown — with the parse/Zod
+  error as `.cause` and the raw model text logged — for both "not valid
+  JSON" and "valid JSON but fails the schema" cases. Neither subagent ever
+  returns a best-effort/partial result.
+- **Prompt engineering — worth reviewing before Phase 3:**
+  - Both system prompts explicitly forbid markdown code fences/preamble,
+    but the parsing code defensively strips a wrapping ` ```json ... ``` `
+    fence if the model adds one anyway before attempting `JSON.parse` —
+    this is normalizing a common LLM formatting quirk, not tolerating bad
+    data; anything that still doesn't parse/validate after that still
+    throws.
+  - `duplicate_of` (Classifier) and `similar_resolved_tickets` /
+    `relevant_docs` (Research): since neither subagent has real search in
+    Phase 2, prompts explicitly tell the model to leave these null/empty
+    unless the *ticket text itself* names another ticket, and explicitly
+    forbid inventing plausible-looking ticket keys or doc titles. Worth
+    re-checking once Phase 3 wires real JIRA/docs search — the prompt
+    should change to prefer the tool result over the model's own guess.
+  - Research's `escalation_flag` guidance nudges the model toward `true`
+    for `category: security` or `severity: critical`, which overlaps with
+    the Coordinator's own business rules (security always escalates,
+    confidence < 0.6 routes to human). This is intentional redundancy, not
+    a conflict — the Coordinator's rules are still the enforcement point;
+    the subagent's flag is advisory context for the human/Coordinator.
+- **Build-order gotcha — found during Phase 2, fixed via TS project
+  references before Phase 2 closed out.** Each package's `types` field
+  points at `./dist/index.d.ts`, so a workspace that depends on another
+  workspace package (e.g. `classifier` → `anthropic-client`) used to fail
+  with "Cannot find module" on a clean checkout until the dependency's
+  `dist/` had been built at least once. Fixed by adding
+  `"composite": true` + a `references` array to every non-dashboard
+  package's `tsconfig.json`, plus a root solution-style `tsconfig.json`
+  (see Repo layout). Every package's `build`/`typecheck` script is now
+  `tsc -b` instead of `tsc -p [--noEmit]` — `tsc -b` walks the reference
+  graph and transitively builds any stale/missing dependency before
+  checking the requested project, so `npm run typecheck -w apps/classifier`
+  run alone, on a tree with no `dist/` anywhere, now succeeds on its own
+  (verified). `apps/dashboard` is deliberately excluded from the reference
+  graph — it's a Vite/`noEmit`-mode project with no workspace dependencies,
+  and `noEmit` is incompatible with `composite`. Its own
+  `build`/`typecheck` scripts are unchanged (`tsc -p tsconfig.json --noEmit`
+  + `vite build`), and the root scripts call it as a separate step after
+  `tsc -b`. One side effect worth knowing: `tsc -b` has no no-emit mode, so
+  `typecheck` now emits to `dist/` same as `build` does — harmless since
+  `dist/` (and the new `*.tsbuildinfo` incremental-cache files, also now
+  gitignored) were never committed, but "typecheck" and "build" are
+  mechanically the same command now; the second one is just a fast
+  incremental no-op.
