@@ -1,0 +1,77 @@
+# CI — Phase 5.
+#
+# Branch protection expectation (configured in repo Settings, NOT here):
+# both "lint-and-test" and "docker-build-check" are intended to be required
+# status checks on `main`, so a PR can't merge unless both are green.
+# Configuring that rule itself is a repo-settings change, out of scope for
+# this workflow file.
+#
+# No JIRA credentials, no registry auth, no Azure/`az` steps here — see
+# CLAUDE.md's "Phase 5 — CI Pipeline" section for why. Pushing images and
+# deploying to Azure Container Apps is Phase 6, not this workflow.
+
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint-and-test:
+    name: Lint, typecheck, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: "npm"
+
+      # Installs every workspace (apps/* and packages/*) from the root
+      # lockfile in one shot — this is an npm workspaces monorepo, not
+      # independently-installed packages.
+      - name: Install dependencies
+        run: npm ci
+
+      # These are root-level scripts (see package.json) that already fan
+      # out across every workspace: `eslint .` lints the whole repo,
+      # `tsc -b` walks the full TS project-references graph (shared-types →
+      # anthropic-client → classifier/research → coordinator, plus the
+      # dashboard as a separate step), and the root `vitest.config.ts` globs
+      # test files from every app/package. No per-package path is
+      # hardcoded, so this stays correct if a workspace is added or removed.
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Runs entirely against the existing stubbed/mocked JIRA and
+      # Anthropic layers (JiraMcpClient and the Anthropic client are both
+      # mocked at the module boundary in every *.test.ts file) — no real
+      # JIRA calls, no real API keys needed, no secrets used in this job.
+      - name: Test
+        run: npm run test
+
+  docker-build-check:
+    name: Docker build check (apps/coordinator)
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Build only — no push, no registry login, no run step. This is the
+      # first time apps/coordinator/Dockerfile has ever actually been built
+      # anywhere: the dev VM that wrote it (Phase 4) has no Docker install,
+      # so everything about it — multi-stage build, workspace copy, prune —
+      # was reasoned through but never executed until this job exists.
+      # Build context is the repo root (matches the Dockerfile's own header
+      # comment), not apps/coordinator, since the npm workspaces graph and
+      # `tsc -b` project references need the whole monorepo present.
+      - name: Build coordinator image
+        run: docker build -f apps/coordinator/Dockerfile -t jira-triage-coordinator:ci .

@@ -15,10 +15,14 @@
     "build": "tsc -b && npm run build -w apps/dashboard",
     "lint": "eslint .",
     "test": "vitest run",
-    "typecheck": "tsc -b && npm run typecheck -w apps/dashboard"
+    "typecheck": "tsc -b && npm run typecheck -w apps/dashboard",
+    "dev": "dotenv -e .env.local -- concurrently -n coordinator,mcp-atlassian -c blue,green \"npm run dev -w apps/coordinator\" \"npm run dev:mcp-atlassian\"",
+    "dev:mcp-atlassian": "uvx mcp-atlassian --transport streamable-http --port 8000 --enabled-tools jira_get_issue,jira_add_comment,jira_update_issue"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
+    "concurrently": "^10.0.3",
+    "dotenv-cli": "^11.0.0",
     "eslint": "^9.9.0",
     "eslint-config-prettier": "^9.1.0",
     "prettier": "^3.3.3",

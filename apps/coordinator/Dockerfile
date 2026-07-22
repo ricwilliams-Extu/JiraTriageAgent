@@ -1,9 +1,14 @@
-# Build context is the REPO ROOT (see docker-compose.yml's `context: .`),
-# not this directory — the npm workspaces graph needs the whole monorepo to
-# resolve symlinks and the `tsc -b` project-references chain.
+# Build context is the REPO ROOT, not this directory (e.g.
+# `docker build -f apps/coordinator/Dockerfile .`) — the npm workspaces
+# graph needs the whole monorepo to resolve symlinks and the `tsc -b`
+# project-references chain.
 #
-# NOT verified with a real `docker build` in the session that authored this
-# (no Docker available in that environment) — smoke-test before trusting it.
+# This dev VM has no Docker at all (not just "wasn't verified" — the
+# `docker` CLI is unavailable), so this file cannot be build/run-tested
+# locally in this phase, full stop. Validation happens in GitHub Actions CI
+# (Phase 5) or via `az acr build` at deploy time (Phase 6), not
+# `docker build` on a developer machine. Treat this as unverified until one
+# of those actually runs it.
 
 FROM node:20-slim AS build
 WORKDIR /app

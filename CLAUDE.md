@@ -23,10 +23,17 @@ that both subagents call into.
 
 - **Language: TypeScript**, npm workspaces monorepo. No Python components.
 - **JIRA access: via `sooperset/mcp-atlassian`** (community MCP server,
-  API-token auth), run as a **sidecar container** alongside the Coordinator.
-  We are explicitly NOT using Atlassian's official Rovo MCP Server, because
-  its OAuth 2.1 flow requires interactive human consent and this service
-  runs unattended on a webhook trigger.
+  API-token auth), run as a **sidecar container** alongside the Coordinator
+  in Azure Container Apps. We are explicitly NOT using Atlassian's official
+  Rovo MCP Server, because its OAuth 2.1 flow requires interactive human
+  consent and this service runs unattended on a webhook trigger.
+  **Local dev runs it as a sibling OS process instead of a container**
+  (`uvx mcp-atlassian`, not Docker — see "Decisions made in Phase 4" for
+  why), but reaches it the same way production does: over `localhost`.
+  Container Apps sidecars share a network namespace and are also reached
+  over `localhost`, so there is no environment-specific hostname branch
+  between local dev and production — `MCP_ATLASSIAN_URL` defaults to
+  `http://localhost:8000/mcp` everywhere.
 - **Hosting: Azure Container Apps**, not Azure Functions. The Agent SDK's
   loop and subagent model want a long-lived Node process, not a stateless
   function invocation.
@@ -65,9 +72,10 @@ that both subagents call into.
 /.github/workflows
   ci.yml              Runs on every PR: install, lint, typecheck, unit test, build
   deploy.yml          Runs on merge to main: build/push images, deploy to Azure
-docker-compose.yml    Coordinator + mcp-atlassian sidecar, local dev only —
-                      see "Decisions made in Phase 4"; NOT smoke-tested with
-                      real Docker in the session that wrote it
+package.json (root)   `dev` script runs Coordinator + mcp-atlassian as sibling
+                      local processes (`concurrently` + `dotenv-cli`, not
+                      docker-compose — this dev VM has no Docker; see
+                      "Decisions made in Phase 4")
 .dockerignore         Keeps node_modules/dist/.git out of the build context
 .env.local.example    Template for `.env.local` (gitignored) — copy, fill in
                       sandbox JIRA + Anthropic credentials
@@ -172,25 +180,33 @@ and the optional Phase 7 dashboard both need this same shape):
 
 - **Local dev:** `.env.local` (gitignored) with dev-only keys — copy
   `.env.local.example` (committed template) and fill in real sandbox
-  values. `docker-compose.yml` runs Coordinator + mcp-atlassian sidecar
-  together for local testing (unverified — see "Decisions made in
-  Phase 4").
-- **CI:** no real secrets — unit/integration tests run against mocked
-  Anthropic responses and a local mcp-atlassian instance pointed at a
-  JIRA sandbox/test project, not production JIRA.
+  values. Root `npm run dev` starts Coordinator and mcp-atlassian together
+  as sibling local processes (`concurrently` + `dotenv-cli`, mcp-atlassian
+  via `uvx`) — not docker-compose, since this dev VM has no Docker
+  installed; see "Decisions made in Phase 4".
+- **CI:** no real secrets. `.github/workflows/ci.yml` (Phase 5) runs
+  entirely against the existing mocked Anthropic-client/`JiraMcpClient`
+  test doubles — there is no live mcp-atlassian instance and no JIRA
+  sandbox wired into CI, despite what this bullet used to say. Live-sandbox
+  integration testing is still blocked on the unchecked "JIRA sandbox
+  project key" open item below, and per Phase 5's explicit scope, real
+  credentials are deliberately kept out of the PR-triggered workflow
+  regardless — see "Decisions made in Phase 5."
 - **Production:** Azure Key Vault + managed identity. No secrets in
   GitHub Actions beyond what's needed for the OIDC federation itself.
 
 ## Build phases (see full plan in project notes — work one phase at a time)
 
-0. This file
-1. Repo scaffolding (empty apps, health checks, workspaces wired up)
-2. Shared types + subagent logic (unit tested against schemas)
-3. Coordinator orchestration (full loop, local mcp-atlassian, no prod JIRA)
-4. Containerization (Dockerfiles + docker-compose for local dev)
-5. GitHub Actions CI (lint/test/build on PR)
-6. GitHub Actions CD (deploy to Azure Container Apps via OIDC)
-7. OPTIONAL: React dashboard over the Cosmos DB audit log
+| Phase | What it covers | Status |
+|---|---|---|
+| 0 | This file | Complete |
+| 1 | Repo scaffolding (empty apps, health checks, workspaces wired up) | Complete |
+| 2 | Shared types + subagent logic (unit tested against schemas) | Complete |
+| 3 | Coordinator orchestration (full loop, local mcp-atlassian, no prod JIRA) | Complete |
+| 4 | Containerization (Dockerfile; local dev uses sibling processes, not docker-compose — this dev VM has no Docker, see "Decisions made in Phase 4") | Complete |
+| 5 | GitHub Actions CI (lint/test/typecheck + Docker build check on PR) | Written, unverified — `.github/workflows/ci.yml` exists but has never run on a real PR (see "Decisions made in Phase 5"); flip to Complete once both jobs go green there |
+| 6 | GitHub Actions CD (deploy to Azure Container Apps via OIDC) | Not started — unblocked to consume the Phase 5-validated Dockerfile once Phase 5 is confirmed green |
+| 7 | OPTIONAL: React dashboard over the Cosmos DB audit log | Not started |
 
 **Do not skip ahead to a later phase's concerns while working on an earlier
 one.** E.g. don't wire real Azure deploys while still building Phase 2's
@@ -351,16 +367,64 @@ access, Docker, and CI are still untouched (Phase 4+).
 ## Decisions made in Phase 4
 
 Phase 4 replaced the `fetchTicket`/`writeBackToJira` stubs with real
-mcp-atlassian calls, added local containerization, and resolved the
-`Ticket`-shape and webhook-idempotency questions flagged for this phase.
-**Important caveat up front: no JIRA sandbox project or credentials were
-available in this session** (CLAUDE.md's "Open items" checklist still has
-this unchecked below), and **Docker itself was not installed in this
-session's environment** — so nothing here has been verified end-to-end
-against a real sandbox ticket or a real `docker compose up`. Both gaps are
-called out explicitly at each relevant point below rather than glossed
-over; treat anything marked unverified as the first thing to smoke-test
-once a sandbox + Docker are both available.
+mcp-atlassian calls, added containerization (Dockerfile only — see the
+Docker-availability pivot below), and resolved the `Ticket`-shape and
+webhook-idempotency questions flagged for this phase. **Important caveat
+up front: no JIRA sandbox project or credentials were available in this
+session** (CLAUDE.md's "Open items" checklist still has this unchecked
+below) — so nothing here has been verified end-to-end against a real
+sandbox ticket. This gap is called out explicitly at each relevant point
+below rather than glossed over; treat anything marked unverified as the
+first thing to smoke-test once a sandbox is available.
+
+- **Pivot: local dev runs Coordinator and mcp-atlassian as sibling
+  processes, not docker-compose — this dev VM has no Docker installed at
+  all** (discovered mid-Phase-4, not merely "unverified" like the sandbox
+  gap; the `docker` CLI itself doesn't exist in this environment).
+  `docker-compose.yml` was removed. In its place: mcp-atlassian runs
+  directly via `uvx mcp-atlassian --transport streamable-http --port 8000
+  --enabled-tools jira_get_issue,jira_add_comment,jira_update_issue`
+  (`uvx` — or `pipx run` — needs to be installed on the dev machine; it is
+  not an npm dependency), and Coordinator runs via its existing
+  `npm run dev`. Root `npm run dev` (new `concurrently` + `dotenv-cli`
+  devDependencies) starts both together: `dotenv-cli` loads `.env.local`
+  (for `JIRA_URL`/`JIRA_USERNAME`/`JIRA_API_TOKEN`/`ANTHROPIC_API_KEY`)
+  into the environment of both child processes, and `concurrently` runs
+  them side by side with labeled, colored output. Chose plain
+  `concurrently` in a root npm script over a Procfile-runner (e.g.
+  `foreman`/`nf`) since it's one more script in the existing
+  `package.json`, not a new process-manager convention, and it's
+  cross-platform (works the same under PowerShell and bash).
+  `ENABLED_TOOLS` is passed as a CLI flag baked into the committed
+  `dev:mcp-atlassian` script (not left to `.env.local`'s discretion) so
+  the tool-scoping requirement below can't be silently dropped by a local
+  env file.
+  - **The `localhost` addressing this forced is actually an improvement,
+    not just a workaround.** The original design modeled `localhost` vs.
+    a compose-network hostname as an environment-specific branch —
+    `http://mcp-atlassian:8000/mcp` locally under compose,
+    `http://localhost:8000/mcp` only once deployed to a shared Azure
+    Container App. That branch no longer exists: `JiraMcpClient`'s
+    `DEFAULT_URL` and `.env.local.example` both now default to
+    `http://localhost:8000/mcp` unconditionally, because sibling local
+    processes and co-located Container App sidecars are both reached over
+    `localhost`. One code path, one default, verified in both places it
+    will actually run — compose was the odd one out, not the norm.
+  - **No compose-style `depends_on: condition: service_healthy` startup
+    ordering exists anymore**, and nothing replaces it — `concurrently`
+    starts both processes at once with no readiness gate between them.
+    This is an accepted gap, not an oversight: `JiraMcpClient.callTool`
+    already retries with backoff (see below), which absorbs a Coordinator
+    request arriving before mcp-atlassian has finished starting up, so
+    the missing startup gate doesn't need a dedicated fix.
+  - **`apps/coordinator/Dockerfile` is still written**, for Phase 6's
+    Azure deploy — but it was not, and could not be, build- or run-tested
+    locally in this session (no `docker` CLI at all, not just "wasn't
+    tried"). Its header comment now says so explicitly: validation is
+    deferred to GitHub Actions CI (Phase 5) or `az acr build` (Phase 6),
+    not a developer's local `docker build`. Don't treat this Dockerfile as
+    more trustworthy than the sandbox-blocked integration tests below —
+    both are "written, unverified."
 
 - **`Ticket`'s shape is unchanged.** Concluded it's fine as-is (see Data
   contracts above) — the adaptation between JIRA's real representation and
@@ -461,20 +525,20 @@ once a sandbox + Docker are both available.
   a second MCP consumer with its own auth/network-access questions, on
   top of everything else in this phase, and out of scope for now.
   Classifier/Research prompts are unchanged from Phase 2.
-- **Docker/docker-compose could not be verified in this session** — no
-  Docker installed in the environment that wrote them. `apps/coordinator/Dockerfile`
-  and `docker-compose.yml` are written carefully (multi-stage build, full
+- **`apps/coordinator/Dockerfile` could not be verified in this
+  session** — no Docker installed in the environment that wrote it (see
+  the pivot bullet above). It's written carefully (multi-stage build, full
   monorepo copy in the build stage to avoid partial-workspace
   `npm ci`/lockfile-consistency issues, pruned `node_modules` copied into
-  a clean runtime stage) but are unverified — both files say so in their
-  own header comments. `docker-compose.yml`'s YAML syntax was validated
-  with `js-yaml` (structurally parses as intended); nothing beyond that.
-  Known accepted inefficiency: `npm prune --omit=dev` runs at the
+  a clean runtime stage) but remains unverified; its own header comment
+  says so and points at CI/`az acr build` as the actual verification
+  point. Known accepted inefficiency: `npm prune --omit=dev` runs at the
   workspace root, so it prunes relative to *all* workspaces including
   `apps/dashboard` (react/vite deps) — the runtime image ships those
   unused prod deps too, since filtering `npm ci`/`prune` to a subset of
   workspaces risks the same lockfile-consistency problem a partial
-  monorepo copy would.
+  monorepo copy would. (`docker-compose.yml` no longer exists — replaced
+  by the sibling-process `npm run dev`, see above.)
 - **Integration tests: unit-level only, by design, given the sandbox
   gap.** `apps/coordinator/src/jira.test.ts` and `jiraMcpClient.test.ts`
   mock the MCP client/SDK entirely — no real network calls, matching the
@@ -485,3 +549,64 @@ once a sandbox + Docker are both available.
   as evidence the real mcp-atlassian integration works — it only proves
   the code behaves correctly against the assumed (unverified)
   response shapes.
+
+## Phase 5 — CI Pipeline
+
+`.github/workflows/ci.yml` adds two jobs, triggered on every `pull_request`
+to `main`:
+
+- **`lint-and-test`** — `actions/checkout` + `actions/setup-node` (Node
+  `20.x`, matching `engines.node` in root `package.json`), `npm ci` (this
+  is an npm workspaces monorepo — one lockfile install covers every
+  `apps/*`/`packages/*` workspace, not per-package installs), then the
+  root `npm run lint` / `npm run typecheck` / `npm run test`. No per-app
+  paths are hardcoded: `eslint .`, `tsc -b` (walks the whole TS
+  project-references graph: `shared-types` → `anthropic-client` →
+  `classifier`/`research` → `coordinator`, plus `apps/dashboard` as its
+  own step per Phase 2's build-order decision), and the root
+  `vitest.config.ts` glob already fan out across every workspace on their
+  own — that's why this job is three plain root-script steps rather than
+  a matrix or a set of per-workspace `-w` invocations. This job runs
+  entirely against the mocked Anthropic-client and `JiraMcpClient` test
+  doubles already in place from Phases 2–4; no real JIRA or Anthropic
+  credentials are used or needed.
+- **`docker-build-check`** — `needs: lint-and-test`, so it only runs once
+  the first job is green. `docker build -f apps/coordinator/Dockerfile -t
+  jira-triage-coordinator:ci .` (context is the repo root, matching the
+  Dockerfile's own header comment about needing the whole workspace graph
+  for `npm ci`/`tsc -b`). **This is the first time this Dockerfile has
+  been built anywhere** — the dev VM that wrote it in Phase 4 has no
+  Docker installed, so every claim in its comments (multi-stage build
+  works, `npm prune --omit=dev` produces a runnable image, etc.) was
+  reasoned through but never executed until this job exists.
+  GitHub-hosted `ubuntu-latest` runners have Docker preinstalled, which is
+  exactly why this validation was deferred to here rather than attempted
+  locally. Build only — no push, no registry login, no container run step;
+  proving the Dockerfile is valid is this job's entire purpose.
+
+**Deliberately out of scope, per this phase's boundaries:**
+- No registry push (ACR/GHCR) and no Azure/`az` CLI step anywhere in this
+  workflow — that's Phase 6 (CD).
+- No real JIRA credentials in the workflow. The "CI: ... a local
+  mcp-atlassian instance pointed at a JIRA sandbox" line that used to be
+  in "Environments and secrets" above was aspirational, not actually
+  built — corrected there. No existing test suite requires live JIRA
+  access (both `jira.test.ts` and `jiraMcpClient.test.ts` mock the MCP
+  client entirely), so nothing had to be excluded from the required job;
+  flagging this explicitly rather than silently discovering it later.
+  Live-sandbox integration testing remains blocked on the same unchecked
+  "JIRA sandbox project key" open item as every prior phase.
+- No branch protection rules configured — `ci.yml`'s header comment notes
+  that both jobs are *intended* as required status checks on `main`, but
+  actually turning that on is a repo Settings change, not something to
+  script into the workflow file.
+
+**Verification status:** lint/typecheck/test pass locally
+(`npm run lint`/`typecheck`/`test`, all green as of this writing) and the
+Dockerfile's syntax/structure was reasoned through again while writing this
+job, but **GitHub Actions workflows can't be meaningfully validated by
+running or simulating them locally** — there's no local equivalent of a
+GitHub-hosted runner's Docker environment or the `pull_request` trigger
+context. The Phase 5 row in the roadmap table above stays "written,
+unverified" until an actual PR shows both `lint-and-test` and
+`docker-build-check` green.

@@ -4,7 +4,7 @@ import pino from "pino";
 
 const logger = pino({ name: "coordinator" });
 
-const DEFAULT_URL = "http://mcp-atlassian:8000/mcp";
+const DEFAULT_URL = "http://localhost:8000/mcp";
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_DELAY_MS = 500;
 
@@ -41,9 +41,12 @@ function extractText(result: Awaited<ReturnType<Client["callTool"]>>): string {
 
 /**
  * Thin wrapper around the MCP client connection to the mcp-atlassian sidecar,
- * reached over the docker-compose network by service name (never `localhost`
- * — that only applies once Coordinator and the sidecar share a single Azure
- * Container App, a Phase 6 deploy-time concern).
+ * reached via `localhost` — Coordinator and the sidecar run as sibling
+ * processes (this dev VM has no Docker, so mcp-atlassian runs directly via
+ * `uvx`, see the root `dev` script) both locally and in the eventual Azure
+ * Container Apps deployment, where sidecar containers in the same Container
+ * App share a network namespace and are also reached over `localhost`. No
+ * environment-specific hostname branching is needed.
  *
  * Two layers of resilience, deliberately not one: `StreamableHTTPClientTransport`
  * has its own built-in reconnection for the underlying SSE stream dropping
@@ -51,6 +54,10 @@ function extractText(result: Awaited<ReturnType<Client["callTool"]>>): string {
  * itself failing outright, so `callTool` here also retries explicitly with
  * backoff, discarding and re-establishing the cached connection on failure —
  * mirroring the retry design already used in `packages/anthropic-client`.
+ * This retry also absorbs the startup race between the two sibling
+ * processes (nothing guarantees mcp-atlassian is ready before Coordinator's
+ * first request) since there's no compose `depends_on: condition:
+ * service_healthy` to sequence them anymore.
  */
 export class JiraMcpClient implements JiraMcpClientLike {
   private client: Client | undefined;
